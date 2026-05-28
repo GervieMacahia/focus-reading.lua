@@ -5,17 +5,16 @@ KOReader patch for EPUB, HTML, and XHTML books. It adds Focus Reading under Typo
 
 When you toggle it, KOReader reloads the book automatically and tries to restore your reading position near where you left off.
 
-How to use
+**How to use**
+1. Put the patch file in koreader/patches.
+2. Restart KOReader.
+3. Open a supported book.
+4. Open the book menu.
+5. Go to Typography.
+6. Find Focus Reading options below Font.
+7.Choose Bionic Reading, Guided Dots, or both.
 
-Put the patch file in koreader/patches.
-Restart KOReader.
-Open a supported book.
-Open the book menu.
-Go to Typography.
-Find Focus Reading below Font.
-Choose Bionic Reading, Guided Dots, or both.
-Notes
-
+**Notes**
 Works on supported text books only.
 Bionic Reading changes word emphasis.
 Guided Dots adds visual markers to help guide your eyes.
