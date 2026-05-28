@@ -14,16 +14,19 @@ When you toggle it, KOReader reloads the book automatically and tries to restore
 6. Find Focus Reading options below Font.
 7. Use the checkbox to toggle **Bionic Reading**, **Guided Dots**, or both.
 \
-**Notes**\
+**Notes**
+\
 Works on supported text books only.
 Bionic Reading changes word emphasis.
 Guided Dots adds visual markers to help guide your eyes.
 If you use hash-based metadata, file rewrites can affect linked progress and other book data.
 \
-**Bionic Reading**\
+**Bionic Reading**
+\
 <img width="695" height="923" alt="image" src="https://github.com/user-attachments/assets/386c41cf-cef4-47a3-988e-439b1d87b518" />
 \
-**Guided Dots**\
+**Guided Dots**
+\
 <img width="696" height="927" alt="image" src="https://github.com/user-attachments/assets/9b00362e-7e24-4817-859f-d609b4023843" />
 \
 **Bionic Reading & Guided Dots**\
