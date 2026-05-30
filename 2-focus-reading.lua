@@ -1,6 +1,6 @@
 local userpatch = require("userpatch")
+local Device = require("device")
 local lfs = require("libs/libkoreader-lfs")
-local Event = require("ui/event")
 local UIManager = require("ui/uimanager")
 local InfoMessage = require("ui/widget/infomessage")
 local Geom = require("ui/geometry")
@@ -8,25 +8,16 @@ local util = require("util")
 local _ = require("gettext")
 
 local PATCH_FLAG = "_intellireading_menu_patch_inplace"
-local READERMENU_PATCH_FLAG = "_intellireading_readermenu_patch_inplace"
 local LOOKUP_PATCH_FLAG = "_intellireading_bionic_lookup_patch_inplace"
 local BIONIC_MENU_KEY = "intellireading_bionic_reading"
 local GUIDED_MENU_KEY = "intellireading_guided_dots"
+local HANDMADE_PATCH_FLAG = "_intellireading_handmade_patch_inplace"
+local DISPATCHER_PATCH_FLAG = "_intellireading_dispatcher_patch_inplace"
 local BACKUP_SUFFIX = ".intellireading.orig"
 local STATE_SUFFIX = ".intellireading.state"
 local FEATURE_BIONIC = "bionic"
 local FEATURE_GUIDED = "guided"
 local GUIDE_DOT_ENTITY = "&middot;"
-local PROTECTED_TEXT_TAGS = {
-    code = true,
-    math = true,
-    pre = true,
-    script = true,
-    style = true,
-    svg = true,
-    textarea = true,
-    title = true,
-}
 
 local TOC_FILENAMES = {
     ["nav.xhtml"] = true,
@@ -245,91 +236,6 @@ local function transform_text_node(text, state)
     return table.concat(pieces)
 end
 
-local function get_tag_name(tag)
-    local closing, name = tag:match("^<%s*(/?)%s*([%w:_-]+)")
-    if not name then
-        return nil, false
-    end
-    return name:lower(), closing == "/"
-end
-
-local function is_self_closing_tag(tag)
-    if tag:match("^<%s*!") or tag:match("^<%s*%?") then
-        return true
-    end
-    return tag:match("/%s*>$") ~= nil
-end
-
-local function count_word_tokens(text, max_count)
-    local count = 0
-    for _ in text:gmatch("[%a][%w_']*") do
-        count = count + 1
-        if max_count and count >= max_count then
-            break
-        end
-    end
-    return count
-end
-
-local function strip_protected_blocks(text)
-    local stripped = text
-    for tag_name in pairs(PROTECTED_TEXT_TAGS) do
-        stripped = stripped:gsub("<" .. tag_name .. "[^>]*>[%z\1-\255]-</" .. tag_name .. "%s*>", " ")
-    end
-    return stripped
-end
-
-local function is_visual_only_body(body_content)
-    local lower = body_content:lower()
-    local has_visual_markup = lower:find("<svg[%s>/]")
-        or lower:find("<img[%s>/]")
-        or lower:find("<image[%s>/]")
-        or lower:find("<object[%s>/]")
-    if not has_visual_markup then
-        return false
-    end
-
-    local stripped = strip_protected_blocks(lower)
-    stripped = stripped:gsub("<[^>]+>", " ")
-    stripped = stripped:gsub("&#?[%a%d]+;", " ")
-    return count_word_tokens(stripped, 3) < 3
-end
-
-local function transform_body_content(body_content, state)
-    local pieces = {}
-    local index = 1
-    local protected_depth = 0
-
-    while true do
-        local tag_start, tag_end, tag = body_content:find("(<[^>]+>)", index)
-        if not tag_start then
-            local tail = body_content:sub(index)
-            pieces[#pieces + 1] = protected_depth > 0 and tail or transform_text_node(tail, state)
-            break
-        end
-
-        if tag_start > index then
-            local text = body_content:sub(index, tag_start - 1)
-            pieces[#pieces + 1] = protected_depth > 0 and text or transform_text_node(text, state)
-        end
-
-        pieces[#pieces + 1] = tag
-
-        local tag_name, is_closing = get_tag_name(tag)
-        if tag_name and PROTECTED_TEXT_TAGS[tag_name] then
-            if is_closing then
-                protected_depth = math.max(0, protected_depth - 1)
-            elseif not is_self_closing_tag(tag) then
-                protected_depth = protected_depth + 1
-            end
-        end
-
-        index = tag_end + 1
-    end
-
-    return table.concat(pieces)
-end
-
 local function transform_html_document(html, state)
     if not has_active_feature(state) then
         return html
@@ -340,11 +246,12 @@ local function transform_html_document(html, state)
         return html
     end
 
-    if is_visual_only_body(body_content) then
-        return html
-    end
-
-    local transformed = transform_body_content(body_content, state)
+    local transformed = body_content:gsub(">([^<]-)<", function(text)
+        if text:match("^%s*$") then
+            return ">" .. text .. "<"
+        end
+        return ">" .. transform_text_node(text, state) .. "<"
+    end)
 
     return html:gsub("(<body[^>]*>)[%z\1-\255]-(</body>)", "%1" .. transformed .. "%2", 1)
 end
@@ -575,6 +482,82 @@ local function round(value)
     return math.floor(value + 0.5)
 end
 
+local function normalize_toc_title(title)
+    return (title or "")
+        :gsub("\13", "")
+        :gsub("%s+", " ")
+        :gsub("^%s+", "")
+        :gsub("%s+$", "")
+        :lower()
+end
+
+local function resolve_saved_chapter(ui, snapshot)
+    if not ui or not ui.toc or not snapshot then
+        return nil
+    end
+
+    local toc = ui.toc.toc
+    if type(toc) ~= "table" then
+        return nil
+    end
+
+    local saved_title = normalize_toc_title(snapshot.chapter_title)
+    local saved_index = tonumber(snapshot.chapter_index)
+
+    local function make_result(item, index)
+        if not item then
+            return nil
+        end
+        return {
+            index = index,
+            page = item.page,
+            xpointer = item.xpointer,
+            title = item.title,
+        }
+    end
+
+    if saved_index and toc[saved_index] then
+        local item = toc[saved_index]
+        if saved_title == "" or normalize_toc_title(item.title) == saved_title then
+            return make_result(item, saved_index)
+        end
+    end
+
+    if saved_title ~= "" then
+        for index, item in ipairs(toc) do
+            if normalize_toc_title(item.title) == saved_title then
+                return make_result(item, index)
+            end
+        end
+    end
+
+    return nil
+end
+
+local function resolve_chapter_target_page(ui, snapshot)
+    local chapter = resolve_saved_chapter(ui, snapshot)
+    if not chapter or not chapter.page then
+        return nil
+    end
+
+    local target_page = tonumber(chapter.page)
+    if not target_page then
+        return nil
+    end
+
+    local old_chapter_pages = tonumber(snapshot.chapter_page_count) or 0
+    local old_chapter_done = tonumber(snapshot.chapter_pages_done) or 0
+    if old_chapter_pages > 1 and old_chapter_done > 0 and ui.toc and ui.toc.getChapterPageCount then
+        local new_chapter_pages = tonumber(ui.toc:getChapterPageCount(target_page)) or 0
+        if new_chapter_pages > 1 then
+            local chapter_ratio = old_chapter_done / math.max(old_chapter_pages - 1, 1)
+            target_page = target_page + round(chapter_ratio * math.max(new_chapter_pages - 1, 0))
+        end
+    end
+
+    return target_page
+end
+
 local function capture_progress(ui)
     if not ui or not ui.document then
         return nil
@@ -596,6 +579,17 @@ local function capture_progress(ui)
         snapshot.location = ui.paging.getBookLocation and ui.paging:getBookLocation() or nil
     end
 
+    if ui.toc then
+        snapshot.chapter_index = ui.toc.getTocIndexByPage and ui.toc:getTocIndexByPage(snapshot.current_page) or nil
+        snapshot.chapter_title = ui.toc.getTocTitleByPage and ui.toc:getTocTitleByPage(snapshot.current_page) or nil
+        snapshot.chapter_pages_done = ui.toc.getChapterPagesDone and ui.toc:getChapterPagesDone(snapshot.current_page) or nil
+        snapshot.chapter_page_count = ui.toc.getChapterPageCount and ui.toc:getChapterPageCount(snapshot.current_page) or nil
+        if snapshot.chapter_index and ui.toc.toc and ui.toc.toc[snapshot.chapter_index] then
+            snapshot.chapter_page = ui.toc.toc[snapshot.chapter_index].page
+            snapshot.chapter_xpointer = ui.toc.toc[snapshot.chapter_index].xpointer
+        end
+    end
+
     return snapshot
 end
 
@@ -608,8 +602,13 @@ local function restore_progress(ui, snapshot)
     local old_pages = tonumber(snapshot.page_count) or 0
     local new_pages = tonumber(document:getPageCount()) or 0
     local current_page = tonumber(snapshot.current_page) or 1
+    local chapter_target_page = resolve_chapter_target_page(ui, snapshot)
 
     if ui.rolling then
+        if chapter_target_page and new_pages > 0 then
+            ui.rolling:_gotoPage(clamp(chapter_target_page, 1, new_pages))
+            return
+        end
         if snapshot.view_mode == "page" then
             if new_pages <= 0 then
                 return
@@ -645,8 +644,12 @@ local function restore_progress(ui, snapshot)
     end
 
     if ui.paging then
-        if snapshot.location and old_pages > 0 and new_pages == old_pages then
+        if snapshot.location and old_pages > 0 then
             ui.paging:onRestoreBookLocation(snapshot.location)
+            return
+        end
+        if chapter_target_page and new_pages > 0 then
+            ui.paging:onGotoPage(clamp(chapter_target_page, 1, new_pages))
             return
         end
         if new_pages <= 0 then
@@ -684,25 +687,7 @@ local function get_toggle_failure_message(feature)
     return _("Bionic reading failed.")
 end
 
-local on_toggle_feature
-
-local function make_feature_menu_item(ui, feature)
-    return {
-        text = get_feature_name(feature),
-        checked_func = function()
-            local file = ui and ui.document and ui.document.file
-            if feature == FEATURE_GUIDED then
-                return is_guided_active_for_file(file)
-            end
-            return is_bionic_active_for_file(file)
-        end,
-        callback = function()
-            on_toggle_feature(ui, feature)
-        end,
-    }
-end
-
-on_toggle_feature = function(ui, feature)
+local function on_toggle_feature(ui, feature)
     if not ui or not ui.document or not is_supported_file(ui.document.file) then
         UIManager:show(InfoMessage:new{
             text = _("Intelli reading supports EPUB/HTML/XHTML files only."),
@@ -719,42 +704,23 @@ on_toggle_feature = function(ui, feature)
     local progress_snapshot = capture_progress(ui)
     local reload_result = { ok = true, err = nil }
 
-    local provider = getmetatable(ui.document).__index
-    local ReaderUI = require("apps/reader/readerui")
-    local has_bookloadcover_patch = ReaderUI._original_showReaderCoroutine_bookloadcover ~= nil
-
-    ui.tearing_down = true
-    ui.dithered = nil
-
-    ui:handleEvent(Event:new("CloseReaderMenu"))
-    ui:handleEvent(Event:new("CloseConfigMenu"))
-    ui:handleEvent(Event:new("PreserveCurrentSession"))
-    ui.highlight:onClose()
-    ui:onClose(false)
-
-    local ok, err = apply_feature_state_inplace(file, new_state)
-    reload_result.ok = ok and true or false
-    reload_result.err = err
-
-    if not has_bookloadcover_patch then
-        ui.reloading = true
-    end
-    UIManager:nextTick(function()
-        ui:showReader(file, provider, true, nil, function()
-            local reloaded_ui = ReaderUI.instance
-            if reload_result.ok then
-                restore_progress(reloaded_ui, progress_snapshot)
-                UIManager:show(InfoMessage:new{
-                    text = get_toggle_success_message(feature, enabled),
-                    timeout = 2,
-                })
-            else
-                UIManager:show(InfoMessage:new{
-                    text = get_toggle_failure_message(feature),
-                    timeout = 2,
-                })
-            end
-        end)
+    ui:reloadDocument(function()
+        local ok, err = apply_feature_state_inplace(file, new_state)
+        reload_result.ok = ok and true or false
+        reload_result.err = err
+    end, nil, function(reloaded_ui)
+        if reload_result.ok then
+            restore_progress(reloaded_ui, progress_snapshot)
+            UIManager:show(InfoMessage:new{
+                text = get_toggle_success_message(feature, enabled),
+                timeout = 2,
+            })
+        else
+            UIManager:show(InfoMessage:new{
+                text = get_toggle_failure_message(feature),
+                timeout = 2,
+            })
+        end
     end)
 end
 
@@ -775,6 +741,23 @@ local function insert_menu_key_before(order, before_key, new_key)
     return false
 end
 
+local function insert_menu_key_after(order, after_key, new_key)
+    for _, key in ipairs(order) do
+        if key == new_key then
+            return true
+        end
+    end
+
+    for index, key in ipairs(order) do
+        if key == after_key then
+            table.insert(order, index + 1, new_key)
+            return true
+        end
+    end
+
+    return false
+end
+
 local function patch_reader_menu_order()
     local ok, order = pcall(require, "ui/elements/reader_menu_order")
     if not ok or not order or not order.typeset then
@@ -784,6 +767,95 @@ local function patch_reader_menu_order()
     local inserted_guided = insert_menu_key_before(order.typeset, "typography", GUIDED_MENU_KEY)
     local inserted_bionic = insert_menu_key_before(order.typeset, "typography", BIONIC_MENU_KEY)
     return inserted_guided or inserted_bionic
+end
+
+local function patch_dispatcher_reader_actions()
+    local ok, Dispatcher = pcall(require, "dispatcher")
+    if not ok or not Dispatcher or type(Dispatcher.registerAction) ~= "function" then
+        return false
+    end
+    if not debug or type(debug.getupvalue) ~= "function" then
+        return false
+    end
+    if Dispatcher[DISPATCHER_PATCH_FLAG] then
+        return true
+    end
+
+    local settings_list
+    local menu_order
+    for i = 1, 32 do
+        local name, value = debug.getupvalue(Dispatcher.registerAction, i)
+        if not name then
+            break
+        end
+        if name == "settingsList" then
+            settings_list = value
+        elseif name == "dispatcher_menu_order" then
+            menu_order = value
+        end
+    end
+    if not settings_list or not menu_order then
+        return false
+    end
+
+    local function register_after(after_key, action_key, action_value)
+        if settings_list[action_key] then
+            return true
+        end
+
+        settings_list[action_key] = action_value
+
+        local inserted = false
+        for index, key in ipairs(menu_order) do
+            if key == after_key then
+                table.insert(menu_order, index + 1, action_key)
+                inserted = true
+                break
+            end
+        end
+        if not inserted then
+            table.insert(menu_order, action_key)
+        end
+        return true
+    end
+
+    register_after("toggle_handmade_flows", "toggle_bionic_reading", {
+        category = "none",
+        event = "ToggleBionicReading",
+        title = _("Toggle bionic reading"),
+        reader = true,
+        condition = Device:isTouchDevice() or (Device:hasDPad() and Device:useDPadAsActionKeys()),
+    })
+    register_after("toggle_bionic_reading", "toggle_guided_dots", {
+        category = "none",
+        event = "ToggleGuidedDots",
+        title = _("Toggle guided dots"),
+        reader = true,
+        condition = Device:isTouchDevice() or (Device:hasDPad() and Device:useDPadAsActionKeys()),
+    })
+
+    Dispatcher[DISPATCHER_PATCH_FLAG] = true
+    return true
+end
+
+local function patch_readerhandmade_actions()
+    local ok, ReaderHandMade = pcall(require, "apps/reader/modules/readerhandmade")
+    if not ok or not ReaderHandMade then
+        return false
+    end
+    if ReaderHandMade[HANDMADE_PATCH_FLAG] then
+        return true
+    end
+
+    ReaderHandMade.onToggleBionicReading = function(self)
+        on_toggle_feature(self and self.ui, FEATURE_BIONIC)
+    end
+    ReaderHandMade.onToggleGuidedDots = function(self)
+        on_toggle_feature(self and self.ui, FEATURE_GUIDED)
+    end
+
+    ReaderHandMade[HANDMADE_PATCH_FLAG] = true
+    return true
 end
 
 local function patch_readertypography_menu()
@@ -798,108 +870,29 @@ local function patch_readertypography_menu()
     local orig_add_to_main_menu = ReaderTypography.addToMainMenu
     ReaderTypography.addToMainMenu = function(self, menu_items)
         orig_add_to_main_menu(self, menu_items)
-        local guided_item = make_feature_menu_item(self and self.ui, FEATURE_GUIDED)
-        local bionic_item = make_feature_menu_item(self and self.ui, FEATURE_BIONIC)
-        guided_item.sorting_hint = "typeset"
-        bionic_item.sorting_hint = "typeset"
-        menu_items[GUIDED_MENU_KEY] = guided_item
-        menu_items[BIONIC_MENU_KEY] = bionic_item
+        menu_items[GUIDED_MENU_KEY] = {
+            text = _("Guided dots"),
+            checked_func = function()
+                local file = self and self.ui and self.ui.document and self.ui.document.file
+                return is_guided_active_for_file(file)
+            end,
+            callback = function()
+                on_toggle_feature(self and self.ui, FEATURE_GUIDED)
+            end,
+        }
+        menu_items[BIONIC_MENU_KEY] = {
+            text = _("Bionic reading"),
+            checked_func = function()
+                local file = self and self.ui and self.ui.document and self.ui.document.file
+                return is_bionic_active_for_file(file)
+            end,
+            callback = function()
+                on_toggle_feature(self and self.ui, FEATURE_BIONIC)
+            end,
+        }
     end
 
     ReaderTypography[PATCH_FLAG] = true
-    return true
-end
-
-local function remove_menu_item_by_id(menu, item_id)
-    if not menu then
-        return nil
-    end
-    for i = #menu, 1, -1 do
-        local item = menu[i]
-        if type(item) == "table" and item.id == item_id then
-            return table.remove(menu, i)
-        end
-    end
-    return nil
-end
-
-local function insert_menu_item_before_id(menu, before_id, item)
-    if not menu or not item then
-        return false
-    end
-    for i = 1, #menu do
-        local existing = menu[i]
-        if type(existing) == "table" and existing.id == before_id then
-            table.insert(menu, i, item)
-            return true
-        end
-    end
-    return false
-end
-
-local function find_menu_containing_id(tabs, item_id)
-    if not tabs then
-        return nil
-    end
-    for _, menu in ipairs(tabs) do
-        if type(menu) == "table" then
-            for __, item in ipairs(menu) do
-                if type(item) == "table" and item.id == item_id then
-                    return menu
-                end
-            end
-        end
-    end
-    return nil
-end
-
-local function patch_readermenu_position()
-    local ok, ReaderMenu = pcall(require, "apps/reader/modules/readermenu")
-    if not ok or not ReaderMenu or type(ReaderMenu.setUpdateItemTable) ~= "function" then
-        return false
-    end
-    if ReaderMenu[READERMENU_PATCH_FLAG] then
-        return true
-    end
-
-    local orig_set_update_item_table = ReaderMenu.setUpdateItemTable
-    ReaderMenu.setUpdateItemTable = function(self, ...)
-        orig_set_update_item_table(self, ...)
-
-        local tabs = self and self.tab_item_table
-        if not tabs then
-            return
-        end
-
-        local guided_item
-        local bionic_item
-        for _, menu in ipairs(tabs) do
-            if type(menu) == "table" then
-                guided_item = guided_item or remove_menu_item_by_id(menu, GUIDED_MENU_KEY)
-                bionic_item = bionic_item or remove_menu_item_by_id(menu, BIONIC_MENU_KEY)
-            end
-        end
-
-        local target_menu = find_menu_containing_id(tabs, "typography")
-        if type(target_menu) ~= "table" then
-            return
-        end
-
-        if guided_item then
-            guided_item.separator = true
-            if not insert_menu_item_before_id(target_menu, "typography", guided_item) then
-                table.insert(target_menu, guided_item)
-            end
-        end
-        if bionic_item then
-            bionic_item.separator = false
-            if not insert_menu_item_before_id(target_menu, "typography", bionic_item) then
-                table.insert(target_menu, bionic_item)
-            end
-        end
-    end
-
-    ReaderMenu[READERMENU_PATCH_FLAG] = true
     return true
 end
 
@@ -1015,8 +1008,10 @@ local function patch_readerhighlight_lookup()
 end
 
 local function apply_patch()
+    patch_dispatcher_reader_actions()
+    patch_readerhandmade_actions()
+    patch_reader_menu_order()
     patch_readertypography_menu()
-    patch_readermenu_position()
     patch_readerhighlight_lookup()
 end
 
